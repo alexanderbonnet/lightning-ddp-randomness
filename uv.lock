@@ -302,6 +302,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "fire" },
     { name = "lightning" },
+    { name = "numpy" },
     { name = "torch" },
 ]
 
@@ -314,6 +315,7 @@ dev = [
 requires-dist = [
     { name = "fire", specifier = ">=0.7.1" },
     { name = "lightning", specifier = ">=2.6.1" },
+    { name = "numpy", specifier = ">=2.0.0" },
     { name = "torch", specifier = ">=2.10.0" },
 ]
 

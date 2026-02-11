@@ -238,12 +238,6 @@ def main(
         for f in LOG_DIR.glob("*.json"):
             f.unlink()
 
-    print("Configuration:")
-    print(f"  seed={seed}, seed_workers={seed_workers}")
-    print(f"  num_workers={num_workers}, persistent_workers={persistent_workers}")
-    print(f"  num_devices={num_devices}, batch_size={batch_size}")
-    print(f"  max_epochs={max_epochs}, dataset_size={dataset_size}")
-
     if seed_everything:
         L.seed_everything(seed, workers=seed_workers)
 
@@ -272,6 +266,12 @@ def main(
 
     if trainer.global_rank == 0:
         print_summary(num_devices, max_epochs, dataset_size)
+        print("\n" + "=" * 70)
+        print("Configuration:")
+        print(f"  seed={seed}, seed_workers={seed_workers}")
+        print(f"  num_workers={num_workers}, persistent_workers={persistent_workers}")
+        print(f"  num_devices={num_devices}, batch_size={batch_size}")
+        print(f"  max_epochs={max_epochs}, dataset_size={dataset_size}")
 
 
 if __name__ == "__main__":

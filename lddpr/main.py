@@ -45,6 +45,10 @@ class RNGProbeModule(LightningModule):
         super().__init__()
         self.model = nn.Linear(1, 1)
         self.loss_fn = nn.MSELoss()
+        # Snapshot weights before DDP broadcasts from rank 0
+        self._init_weights = {
+            name: param.detach().cpu().tolist() for name, param in self.model.named_parameters()
+        }
         self.epoch_records: list[dict] = []
         self._current_epoch_steps: list[dict] = []
 
@@ -86,8 +90,12 @@ class RNGProbeModule(LightningModule):
     def on_train_end(self):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = LOG_DIR / f"rank{self.global_rank}.json"
+        payload = {
+            "init_weights": self._init_weights,
+            "epochs": self.epoch_records,
+        }
         with open(log_path, "w") as f:
-            json.dump(self.epoch_records, f, indent=2)
+            json.dump(payload, f, indent=2)
 
     def configure_optimizers(self):
         return torch.optim.SGD(self.model.parameters(), lr=0.001)
@@ -98,9 +106,12 @@ class RNGProbeModule(LightningModule):
 # ---------------------------------------------------------------------------
 
 
-def _load_logs(num_ranks: int, max_epochs: int) -> dict[int, list[dict]]:
-    """Poll for and load JSON log files written by each rank."""
-    logs: dict[int, list[dict]] = {}
+def _load_logs(num_ranks: int, max_epochs: int) -> dict[int, dict]:
+    """Poll for and load JSON log files written by each rank.
+
+    Each rank's log is a dict with keys ``"init_weights"`` and ``"epochs"``.
+    """
+    logs: dict[int, dict] = {}
     for rank in range(num_ranks):
         log_path = LOG_DIR / f"rank{rank}.json"
         for _ in range(30):
@@ -108,7 +119,7 @@ def _load_logs(num_ranks: int, max_epochs: int) -> dict[int, list[dict]]:
                 try:
                     with open(log_path) as f:
                         data = json.load(f)
-                    if len(data) >= max_epochs:
+                    if len(data.get("epochs", [])) >= max_epochs:
                         logs[rank] = data
                         break
                 except (json.JSONDecodeError, ValueError):
@@ -131,13 +142,13 @@ def _cross_rank_match(values: dict[int, object]) -> str:
 
 
 def _get_epoch_data(
-    logs: dict[int, list[dict]], epoch: int
+    logs: dict[int, dict], epoch: int
 ) -> tuple[dict[int, list[int]], dict[int, list[dict]]]:
     """Extract per-rank sample indices and step records for a given epoch."""
     indices_per_rank: dict[int, list[int]] = {}
     steps_per_rank: dict[int, list[dict]] = {}
     for rank in sorted(logs.keys()):
-        epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
+        epoch_data = next((e for e in logs[rank]["epochs"] if e["epoch"] == epoch), None)
         if epoch_data is None:
             print(f"  Rank {rank}: NO DATA")
             continue
@@ -239,17 +250,52 @@ def _print_step_rng(steps_per_rank: dict[int, list[dict]]):
             print(f"      {key:16s}: {' | '.join(parts)}  [{match_str}]")
 
 
-def _print_final_summary(logs: dict[int, list[dict]], max_epochs: int):
+def _print_weight_init(logs: dict[int, dict]):
+    """Compare model weight initialization across ranks (before DDP sync).
+
+    DDP broadcasts rank 0's parameters to all ranks before training, so weights
+    are always identical when training begins.  This check shows whether the
+    independent per-process initialization was *already* consistent (i.e. the
+    RNG state was seeded identically) before that broadcast.
+    """
+    init_weights = {
+        rank: log["init_weights"] for rank, log in logs.items() if "init_weights" in log
+    }
+    if len(init_weights) < 2:
+        return
+
+    print("\n  Model weight init (pre-DDP broadcast):")
+    param_names = list(next(iter(init_weights.values())).keys())
+    all_match = True
+    for name in param_names:
+        values = {rank: w[name] for rank, w in init_weights.items() if name in w}
+        match = _cross_rank_match(values)
+        label = "SAME across ranks" if match == "SAME" else "DIFFERENT across ranks"
+        print(f"    {name:20s}: {label}")
+        if match == "DIFF":
+            all_match = False
+            for rank, v in sorted(values.items()):
+                print(f"      Rank {rank}: {v}")
+    if all_match:
+        print("    -> Seeding produced identical init across all ranks")
+    else:
+        print("    -> Init differed, but DDP broadcast from rank 0 ensures identical")
+        print("       weights before training starts")
+
+
+def _print_final_summary(logs: dict[int, dict], max_epochs: int):
     print(f"\n{'=' * 70}")
     print(" SUMMARY")
     print(f"{'=' * 70}")
+
+    _print_weight_init(logs)
 
     # Shuffle consistency across epochs
     print("\n  Shuffle across epochs:")
     for rank in sorted(logs.keys()):
         orders = []
         for epoch in range(max_epochs):
-            epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
+            epoch_data = next((e for e in logs[rank]["epochs"] if e["epoch"] == epoch), None)
             if epoch_data:
                 orders.append(
                     [idx for step in epoch_data["steps"] for idx in step["sample_indices"]]
@@ -264,7 +310,7 @@ def _print_final_summary(logs: dict[int, list[dict]], max_epochs: int):
     print("\n  RNG cross-rank match (epoch 0, step 0):")
     first_steps: dict[int, dict] = {}
     for rank in sorted(logs.keys()):
-        epoch_data = next((e for e in logs[rank] if e["epoch"] == 0), None)
+        epoch_data = next((e for e in logs[rank]["epochs"] if e["epoch"] == 0), None)
         if epoch_data and epoch_data["steps"]:
             first_steps[rank] = epoch_data["steps"][0]
 

@@ -11,9 +11,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 from lightning import LightningModule, Trainer
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 
 LOG_DIR = Path("/tmp/lddpr_logs")
+
+
+class RNGProbeDataset(Dataset):
+    """Dataset that records RNG values sampled inside __getitem__ (runs in worker process)."""
+
+    def __init__(self, size: int):
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        import torch.utils.data as _data
+
+        worker_info = _data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else -1
+        return (
+            torch.tensor(idx),
+            torch.tensor(worker_id),
+            torch.tensor(torch.rand(1).item()),       # dl_torch_rand
+            torch.tensor(np.random.random()),          # dl_np_rand
+            torch.tensor(random.random()),             # dl_py_rand
+        )
 
 
 class RNGProbeModule(LightningModule):
@@ -25,7 +48,7 @@ class RNGProbeModule(LightningModule):
         self._current_epoch_steps: list[dict] = []
 
     def training_step(self, batch, batch_idx):
-        (indices,) = batch
+        indices, worker_ids, dl_torch_rand, dl_np_rand, dl_py_rand = batch
         x = indices.float().unsqueeze(-1)
         y = self.model(x)
         loss = self.loss_fn(y, x)
@@ -33,6 +56,12 @@ class RNGProbeModule(LightningModule):
         record = {
             "batch_idx": batch_idx,
             "sample_indices": indices.tolist(),
+            "worker_ids": worker_ids.tolist(),
+            # RNG values from dataloader workers
+            "dl_torch_rand": dl_torch_rand.tolist(),
+            "dl_np_rand": dl_np_rand.tolist(),
+            "dl_py_rand": dl_py_rand.tolist(),
+            # RNG values from main process (training_step)
             "torch_rand": torch.rand(1).item(),
             "np_rand": np.random.random(),
             "py_rand": random.random(),
@@ -153,15 +182,44 @@ def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
         prev_epoch_indices = dict(epoch_indices_per_rank)
 
         # RNG values
-        print("\n  RNG Values Per Step:")
-        rng_keys = ["torch_rand", "np_rand", "py_rand"]
+        main_rng_keys = ["torch_rand", "np_rand", "py_rand"]
         if any("cuda_rand" in s for steps in epoch_steps_per_rank.values() for s in steps):
-            rng_keys.append("cuda_rand")
+            main_rng_keys.append("cuda_rand")
+        dl_rng_keys = ["dl_torch_rand", "dl_np_rand", "dl_py_rand"]
 
         max_steps = max((len(steps) for steps in epoch_steps_per_rank.values()), default=0)
         for step_idx in range(max_steps):
             print(f"\n    Step {step_idx}:")
-            for key in rng_keys:
+
+            # Worker IDs
+            for rank in sorted(epoch_steps_per_rank.keys()):
+                steps = epoch_steps_per_rank[rank]
+                if step_idx < len(steps) and "worker_ids" in steps[step_idx]:
+                    print(f"      Rank {rank} worker_ids: {steps[step_idx]['worker_ids']}")
+
+            # Dataloader RNG (per-sample values from workers)
+            print("      --- dataloader (worker process) ---")
+            for key in dl_rng_keys:
+                values = {}
+                for rank in sorted(epoch_steps_per_rank.keys()):
+                    steps = epoch_steps_per_rank[rank]
+                    if step_idx < len(steps) and key in steps[step_idx]:
+                        values[rank] = steps[step_idx][key]
+
+                if len(values) >= 2:
+                    vals = list(values.values())
+                    all_match = all(v == vals[0] for v in vals[1:])
+                    match_str = "SAME" if all_match else "DIFF"
+                else:
+                    match_str = "N/A"
+
+                for rank, v in sorted(values.items()):
+                    fmt = [f"{x:.6f}" for x in v] if isinstance(v, list) else [f"{v:.6f}"]
+                    print(f"      {key:16s} R{rank}: [{', '.join(fmt)}]  [{match_str}]")
+
+            # Main process RNG (single value per step)
+            print("      --- training_step (main process) ---")
+            for key in main_rng_keys:
                 values = {}
                 for rank in sorted(epoch_steps_per_rank.keys()):
                     steps = epoch_steps_per_rank[rank]
@@ -176,7 +234,7 @@ def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
                     match_str = "N/A"
 
                 parts = [f"R{rank}={v:.6f}" for rank, v in sorted(values.items())]
-                print(f"      {key:12s}: {' | '.join(parts)}  [{match_str}]")
+                print(f"      {key:16s}: {' | '.join(parts)}  [{match_str}]")
 
     # Final summary
     print(f"\n{'=' * 70}")
@@ -209,16 +267,28 @@ def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
             first_epoch_steps[rank] = epoch_data["steps"][0]
 
     if len(first_epoch_steps) >= 2:
-        rng_keys_check = ["torch_rand", "np_rand", "py_rand"]
+        print("    --- training_step (main process) ---")
+        main_keys = ["torch_rand", "np_rand", "py_rand"]
         if any("cuda_rand" in s for s in first_epoch_steps.values()):
-            rng_keys_check.append("cuda_rand")
-        for key in rng_keys_check:
+            main_keys.append("cuda_rand")
+        for key in main_keys:
             vals = {r: s[key] for r, s in first_epoch_steps.items() if key in s}
             if len(vals) >= 2:
                 v_list = list(vals.values())
                 match = all(v == v_list[0] for v in v_list[1:])
                 print(
-                    f"    {key:12s}: {'SAME across ranks' if match else 'DIFFERENT across ranks'}"
+                    f"    {key:16s}: {'SAME across ranks' if match else 'DIFFERENT across ranks'}"
+                )
+
+        print("    --- dataloader (worker process) ---")
+        dl_keys = ["dl_torch_rand", "dl_np_rand", "dl_py_rand"]
+        for key in dl_keys:
+            vals = {r: s[key] for r, s in first_epoch_steps.items() if key in s}
+            if len(vals) >= 2:
+                v_list = list(vals.values())
+                match = all(v == v_list[0] for v in v_list[1:])
+                print(
+                    f"    {key:16s}: {'SAME across ranks' if match else 'DIFFERENT across ranks'}"
                 )
 
 
@@ -241,7 +311,7 @@ def main(
     if seed_everything:
         L.seed_everything(seed, workers=seed_workers)
 
-    dataset = TensorDataset(torch.arange(dataset_size))
+    dataset = RNGProbeDataset(dataset_size)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,

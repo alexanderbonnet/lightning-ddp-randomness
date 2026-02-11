@@ -11,9 +11,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from lightning import LightningModule, Trainer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 LOG_DIR = Path("/tmp/lddpr_logs")
+
+MAIN_RNG_KEYS = ["torch_rand", "np_rand", "py_rand"]
+DL_RNG_KEYS = ["dl_torch_rand", "dl_np_rand", "dl_py_rand"]
 
 
 class RNGProbeDataset(Dataset):
@@ -26,16 +29,14 @@ class RNGProbeDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
-        import torch.utils.data as _data
-
-        worker_info = _data.get_worker_info()
+        worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else -1
         return (
             torch.tensor(idx),
             torch.tensor(worker_id),
-            torch.tensor(torch.rand(1).item()),       # dl_torch_rand
-            torch.tensor(np.random.random()),          # dl_np_rand
-            torch.tensor(random.random()),             # dl_py_rand
+            torch.tensor(torch.rand(1).item()),  # dl_torch_rand
+            torch.tensor(np.random.random()),  # dl_np_rand
+            torch.tensor(random.random()),  # dl_py_rand
         )
 
 
@@ -92,7 +93,13 @@ class RNGProbeModule(LightningModule):
         return torch.optim.SGD(self.model.parameters(), lr=0.001)
 
 
-def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
+# ---------------------------------------------------------------------------
+# Analysis helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_logs(num_ranks: int, max_epochs: int) -> dict[int, list[dict]]:
+    """Poll for and load JSON log files written by each rank."""
     logs: dict[int, list[dict]] = {}
     for rank in range(num_ranks):
         log_path = LOG_DIR / f"rank{rank}.json"
@@ -112,12 +119,183 @@ def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
             if log_path.exists():
                 with open(log_path) as f:
                     logs[rank] = json.load(f)
+    return logs
 
+
+def _cross_rank_match(values: dict[int, object]) -> str:
+    """Return 'SAME', 'DIFF', or 'N/A' depending on whether all rank values agree."""
+    if len(values) < 2:
+        return "N/A"
+    vals = list(values.values())
+    return "SAME" if all(v == vals[0] for v in vals[1:]) else "DIFF"
+
+
+def _get_epoch_data(
+    logs: dict[int, list[dict]], epoch: int
+) -> tuple[dict[int, list[int]], dict[int, list[dict]]]:
+    """Extract per-rank sample indices and step records for a given epoch."""
+    indices_per_rank: dict[int, list[int]] = {}
+    steps_per_rank: dict[int, list[dict]] = {}
+    for rank in sorted(logs.keys()):
+        epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
+        if epoch_data is None:
+            print(f"  Rank {rank}: NO DATA")
+            continue
+        steps = epoch_data["steps"]
+        indices = [idx for step in steps for idx in step["sample_indices"]]
+        indices_per_rank[rank] = indices
+        steps_per_rank[rank] = steps
+    return indices_per_rank, steps_per_rank
+
+
+def _main_rng_keys(steps_per_rank: dict[int, list[dict]]) -> list[str]:
+    """Return the main-process RNG keys, including cuda_rand when present."""
+    keys = list(MAIN_RNG_KEYS)
+    if any("cuda_rand" in s for steps in steps_per_rank.values() for s in steps):
+        keys.append("cuda_rand")
+    return keys
+
+
+def _print_sample_distribution(
+    indices_per_rank: dict[int, list[int]],
+    dataset_size: int,
+):
+    all_indices = set(range(dataset_size))
+    print("\n  Sample Distribution:")
+    for rank in sorted(indices_per_rank.keys()):
+        print(f"    Rank {rank}: {indices_per_rank[rank]}")
+
+    combined = [idx for indices in indices_per_rank.values() for idx in indices]
+    combined_set = set(combined)
+    missing = all_indices - combined_set
+    duplicates = len(combined) - len(combined_set)
+
+    print(f"\n  Coverage: {len(combined_set)}/{dataset_size} indices covered")
+    if missing:
+        print(f"  Missing indices: {sorted(missing)}")
+    if duplicates:
+        print(f"  Duplicate samples across ranks: {duplicates}")
+    else:
+        print("  No duplicates across ranks")
+
+    # Overlap between rank pairs
+    ranks = sorted(indices_per_rank.keys())
+    for i, r_i in enumerate(ranks):
+        for r_j in ranks[i + 1 :]:
+            overlap = set(indices_per_rank[r_i]) & set(indices_per_rank[r_j])
+            if overlap:
+                print(f"  Overlap rank {r_i} & {r_j}: {sorted(overlap)}")
+
+
+def _print_shuffle_change(
+    indices_per_rank: dict[int, list[int]],
+    prev_indices: dict[int, list[int]],
+):
+    if not prev_indices:
+        return
+    print("\n  Shuffle Change vs Previous Epoch:")
+    for rank in sorted(indices_per_rank.keys()):
+        if rank in prev_indices:
+            same = indices_per_rank[rank] == prev_indices[rank]
+            print(f"    Rank {rank}: {'SAME order' if same else 'DIFFERENT order'}")
+
+
+def _print_step_rng(steps_per_rank: dict[int, list[dict]]):
+    main_keys = _main_rng_keys(steps_per_rank)
+    max_steps = max((len(s) for s in steps_per_rank.values()), default=0)
+
+    for step_idx in range(max_steps):
+        print(f"\n    Step {step_idx}:")
+
+        # Worker IDs
+        for rank in sorted(steps_per_rank.keys()):
+            steps = steps_per_rank[rank]
+            if step_idx < len(steps) and "worker_ids" in steps[step_idx]:
+                print(f"      Rank {rank} worker_ids: {steps[step_idx]['worker_ids']}")
+
+        # Dataloader RNG (per-sample values from workers)
+        print("      --- dataloader (worker process) ---")
+        for key in DL_RNG_KEYS:
+            values = {
+                rank: steps[step_idx][key]
+                for rank, steps in sorted(steps_per_rank.items())
+                if step_idx < len(steps) and key in steps[step_idx]
+            }
+            match_str = _cross_rank_match(values)
+            for rank, v in sorted(values.items()):
+                fmt = [f"{x:.6f}" for x in v] if isinstance(v, list) else [f"{v:.6f}"]
+                print(f"      {key:16s} R{rank}: [{', '.join(fmt)}]  [{match_str}]")
+
+        # Main process RNG (single value per step)
+        print("      --- training_step (main process) ---")
+        for key in main_keys:
+            values = {
+                rank: steps[step_idx][key]
+                for rank, steps in sorted(steps_per_rank.items())
+                if step_idx < len(steps) and key in steps[step_idx]
+            }
+            match_str = _cross_rank_match(values)
+            parts = [f"R{rank}={v:.6f}" for rank, v in sorted(values.items())]
+            print(f"      {key:16s}: {' | '.join(parts)}  [{match_str}]")
+
+
+def _print_final_summary(logs: dict[int, list[dict]], max_epochs: int):
+    print(f"\n{'=' * 70}")
+    print(" SUMMARY")
+    print(f"{'=' * 70}")
+
+    # Shuffle consistency across epochs
+    print("\n  Shuffle across epochs:")
+    for rank in sorted(logs.keys()):
+        orders = []
+        for epoch in range(max_epochs):
+            epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
+            if epoch_data:
+                orders.append(
+                    [idx for step in epoch_data["steps"] for idx in step["sample_indices"]]
+                )
+        if len(orders) >= 2:
+            all_same = all(o == orders[0] for o in orders[1:])
+            print(
+                f"    Rank {rank}: {'SAME every epoch' if all_same else 'CHANGES between epochs'}"
+            )
+
+    # Cross-rank RNG match (epoch 0, step 0)
+    print("\n  RNG cross-rank match (epoch 0, step 0):")
+    first_steps: dict[int, dict] = {}
+    for rank in sorted(logs.keys()):
+        epoch_data = next((e for e in logs[rank] if e["epoch"] == 0), None)
+        if epoch_data and epoch_data["steps"]:
+            first_steps[rank] = epoch_data["steps"][0]
+
+    if len(first_steps) >= 2:
+        main_keys = list(MAIN_RNG_KEYS)
+        if any("cuda_rand" in s for s in first_steps.values()):
+            main_keys.append("cuda_rand")
+
+        print("    --- training_step (main process) ---")
+        for key in main_keys:
+            values = {r: s[key] for r, s in first_steps.items() if key in s}
+            match = _cross_rank_match(values)
+            print(
+                f"    {key:16s}: {'SAME across ranks' if match == 'SAME' else 'DIFFERENT across ranks'}"
+            )
+
+        print("    --- dataloader (worker process) ---")
+        for key in DL_RNG_KEYS:
+            values = {r: s[key] for r, s in first_steps.items() if key in s}
+            match = _cross_rank_match(values)
+            print(
+                f"    {key:16s}: {'SAME across ranks' if match == 'SAME' else 'DIFFERENT across ranks'}"
+            )
+
+
+def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
+    logs = _load_logs(num_ranks, max_epochs)
     if not logs:
         print("ERROR: No logs found!")
         return
 
-    all_indices = set(range(dataset_size))
     prev_epoch_indices: dict[int, list[int]] = {}
 
     for epoch in range(max_epochs):
@@ -125,171 +303,13 @@ def print_summary(num_ranks: int, max_epochs: int, dataset_size: int):
         print(f" EPOCH {epoch}")
         print(f"{'=' * 70}")
 
-        epoch_indices_per_rank: dict[int, list[int]] = {}
-        epoch_steps_per_rank: dict[int, list[dict]] = {}
+        indices_per_rank, steps_per_rank = _get_epoch_data(logs, epoch)
+        _print_sample_distribution(indices_per_rank, dataset_size)
+        _print_shuffle_change(indices_per_rank, prev_epoch_indices)
+        _print_step_rng(steps_per_rank)
+        prev_epoch_indices = dict(indices_per_rank)
 
-        for rank in sorted(logs.keys()):
-            epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
-            if epoch_data is None:
-                print(f"  Rank {rank}: NO DATA")
-                continue
-            steps = epoch_data["steps"]
-            indices = []
-            for step in steps:
-                indices.extend(step["sample_indices"])
-            epoch_indices_per_rank[rank] = indices
-            epoch_steps_per_rank[rank] = steps
-
-        # Sample distribution
-        print("\n  Sample Distribution:")
-        for rank in sorted(epoch_indices_per_rank.keys()):
-            indices = epoch_indices_per_rank[rank]
-            print(f"    Rank {rank}: {indices}")
-
-        combined = []
-        for indices in epoch_indices_per_rank.values():
-            combined.extend(indices)
-        combined_set = set(combined)
-        missing = all_indices - combined_set
-        duplicates = len(combined) - len(combined_set)
-
-        print(f"\n  Coverage: {len(combined_set)}/{dataset_size} indices covered")
-        if missing:
-            print(f"  Missing indices: {sorted(missing)}")
-        if duplicates:
-            print(f"  Duplicate samples across ranks: {duplicates}")
-        else:
-            print("  No duplicates across ranks")
-
-        # Check overlap between ranks
-        if len(epoch_indices_per_rank) >= 2:
-            ranks = sorted(epoch_indices_per_rank.keys())
-            for i in range(len(ranks)):
-                for j in range(i + 1, len(ranks)):
-                    r_i, r_j = ranks[i], ranks[j]
-                    overlap = set(epoch_indices_per_rank[r_i]) & set(epoch_indices_per_rank[r_j])
-                    if overlap:
-                        print(f"  Overlap rank {r_i} & {r_j}: {sorted(overlap)}")
-
-        # Cross-epoch shuffle comparison
-        if prev_epoch_indices:
-            print("\n  Shuffle Change vs Previous Epoch:")
-            for rank in sorted(epoch_indices_per_rank.keys()):
-                if rank in prev_epoch_indices:
-                    same = epoch_indices_per_rank[rank] == prev_epoch_indices[rank]
-                    print(f"    Rank {rank}: {'SAME order' if same else 'DIFFERENT order'}")
-
-        prev_epoch_indices = dict(epoch_indices_per_rank)
-
-        # RNG values
-        main_rng_keys = ["torch_rand", "np_rand", "py_rand"]
-        if any("cuda_rand" in s for steps in epoch_steps_per_rank.values() for s in steps):
-            main_rng_keys.append("cuda_rand")
-        dl_rng_keys = ["dl_torch_rand", "dl_np_rand", "dl_py_rand"]
-
-        max_steps = max((len(steps) for steps in epoch_steps_per_rank.values()), default=0)
-        for step_idx in range(max_steps):
-            print(f"\n    Step {step_idx}:")
-
-            # Worker IDs
-            for rank in sorted(epoch_steps_per_rank.keys()):
-                steps = epoch_steps_per_rank[rank]
-                if step_idx < len(steps) and "worker_ids" in steps[step_idx]:
-                    print(f"      Rank {rank} worker_ids: {steps[step_idx]['worker_ids']}")
-
-            # Dataloader RNG (per-sample values from workers)
-            print("      --- dataloader (worker process) ---")
-            for key in dl_rng_keys:
-                values = {}
-                for rank in sorted(epoch_steps_per_rank.keys()):
-                    steps = epoch_steps_per_rank[rank]
-                    if step_idx < len(steps) and key in steps[step_idx]:
-                        values[rank] = steps[step_idx][key]
-
-                if len(values) >= 2:
-                    vals = list(values.values())
-                    all_match = all(v == vals[0] for v in vals[1:])
-                    match_str = "SAME" if all_match else "DIFF"
-                else:
-                    match_str = "N/A"
-
-                for rank, v in sorted(values.items()):
-                    fmt = [f"{x:.6f}" for x in v] if isinstance(v, list) else [f"{v:.6f}"]
-                    print(f"      {key:16s} R{rank}: [{', '.join(fmt)}]  [{match_str}]")
-
-            # Main process RNG (single value per step)
-            print("      --- training_step (main process) ---")
-            for key in main_rng_keys:
-                values = {}
-                for rank in sorted(epoch_steps_per_rank.keys()):
-                    steps = epoch_steps_per_rank[rank]
-                    if step_idx < len(steps) and key in steps[step_idx]:
-                        values[rank] = steps[step_idx][key]
-
-                if len(values) >= 2:
-                    vals = list(values.values())
-                    all_match = all(v == vals[0] for v in vals[1:])
-                    match_str = "SAME" if all_match else "DIFF"
-                else:
-                    match_str = "N/A"
-
-                parts = [f"R{rank}={v:.6f}" for rank, v in sorted(values.items())]
-                print(f"      {key:16s}: {' | '.join(parts)}  [{match_str}]")
-
-    # Final summary
-    print(f"\n{'=' * 70}")
-    print(" SUMMARY")
-    print(f"{'=' * 70}")
-
-    # Check if shuffle order changed across epochs for each rank
-    print("\n  Shuffle across epochs:")
-    for rank in sorted(logs.keys()):
-        orders = []
-        for epoch in range(max_epochs):
-            epoch_data = next((e for e in logs[rank] if e["epoch"] == epoch), None)
-            if epoch_data:
-                indices = []
-                for step in epoch_data["steps"]:
-                    indices.extend(step["sample_indices"])
-                orders.append(indices)
-        if len(orders) >= 2:
-            all_same = all(o == orders[0] for o in orders[1:])
-            print(
-                f"    Rank {rank}: {'SAME every epoch' if all_same else 'CHANGES between epochs'}"
-            )
-
-    # Check if RNG streams match across ranks in first epoch
-    print("\n  RNG cross-rank match (epoch 0, step 0):")
-    first_epoch_steps: dict[int, dict] = {}
-    for rank in sorted(logs.keys()):
-        epoch_data = next((e for e in logs[rank] if e["epoch"] == 0), None)
-        if epoch_data and epoch_data["steps"]:
-            first_epoch_steps[rank] = epoch_data["steps"][0]
-
-    if len(first_epoch_steps) >= 2:
-        print("    --- training_step (main process) ---")
-        main_keys = ["torch_rand", "np_rand", "py_rand"]
-        if any("cuda_rand" in s for s in first_epoch_steps.values()):
-            main_keys.append("cuda_rand")
-        for key in main_keys:
-            vals = {r: s[key] for r, s in first_epoch_steps.items() if key in s}
-            if len(vals) >= 2:
-                v_list = list(vals.values())
-                match = all(v == v_list[0] for v in v_list[1:])
-                print(
-                    f"    {key:16s}: {'SAME across ranks' if match else 'DIFFERENT across ranks'}"
-                )
-
-        print("    --- dataloader (worker process) ---")
-        dl_keys = ["dl_torch_rand", "dl_np_rand", "dl_py_rand"]
-        for key in dl_keys:
-            vals = {r: s[key] for r, s in first_epoch_steps.items() if key in s}
-            if len(vals) >= 2:
-                v_list = list(vals.values())
-                match = all(v == v_list[0] for v in v_list[1:])
-                print(
-                    f"    {key:16s}: {'SAME across ranks' if match else 'DIFFERENT across ranks'}"
-                )
+    _print_final_summary(logs, max_epochs)
 
 
 def main(

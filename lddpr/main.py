@@ -34,8 +34,8 @@ class RNGProbeDataset(Dataset):
         return (
             torch.tensor(idx),
             torch.tensor(worker_id),
-            torch.tensor(torch.rand(1).item()),  # dl_torch_rand
-            torch.tensor(np.random.random()),  # dl_np_rand
+            torch.rand(()),  # dl_torch_rand
+            torch.as_tensor(np.random.random()),  # dl_np_rand
             torch.tensor(random.random()),  # dl_py_rand
         )
 
@@ -82,7 +82,7 @@ class RNGProbeModule(LightningModule):
             {
                 "epoch": self.current_epoch,
                 "rank": self.global_rank,
-                "steps": list(self._current_epoch_steps),
+                "steps": self._current_epoch_steps,
             }
         )
         self._current_epoch_steps = []
@@ -128,8 +128,11 @@ def _load_logs(num_ranks: int, max_epochs: int) -> dict[int, dict]:
         else:
             print(f"WARNING: Could not read complete log for rank {rank}")
             if log_path.exists():
-                with open(log_path) as f:
-                    logs[rank] = json.load(f)
+                try:
+                    with open(log_path) as f:
+                        logs[rank] = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    print(f"WARNING: Log for rank {rank} is corrupt, skipping")
     return logs
 
 

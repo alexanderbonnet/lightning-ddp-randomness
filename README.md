@@ -1,5 +1,7 @@
 # lightning-ddp-randomness
 
+> **TL;DR:** set `seed_everything` with `workers=True` and `num_workers>=1` in your dataloader. THis should work for most applications.
+
 A diagnostic tool for understanding how RNG states behave across processes when using [PyTorch Lightning](https://lightning.ai/) with DDP.
 
 `seed_everything` is supposed to make training deterministic, but the interactions between Python, NumPy, PyTorch, and CUDA RNGs across multiple processes and dataloader workers can be surprising. This tool makes the behavior visible by sampling from each RNG in both worker and main processes, then comparing values across ranks.
